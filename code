@@ -1,0 +1,548 @@
+import os
+import time
+import hmac
+import base64
+import struct
+import hashlib
+import json
+import bcrypt
+import qrcode
+from urllib.parse import urlparse, parse_qs
+
+# Biblioteka ttkbootstrap
+import ttkbootstrap as tb
+from ttkbootstrap.dialogs import Messagebox
+from ttkbootstrap.constants import *
+
+from tkinter import END, BOTH, LEFT, RIGHT, X, Y, TOP
+from tkinter import filedialog, Scrollbar, Listbox
+
+from cryptography.fernet import Fernet
+from pyzbar.pyzbar import decode
+from PIL import Image, ImageTk
+
+# Opcjonalne - do skanowania QR ze zrzutu ekranu:
+try:
+    import pyautogui
+    CAN_SCREENSHOT = True
+except ImportError:
+    CAN_SCREENSHOT = False
+
+CONFIG_DIR = "users"
+ENCRYPTION_KEY_FILE = "encryption.key"
+
+if not os.path.exists(CONFIG_DIR):
+    os.makedirs(CONFIG_DIR)
+
+# -------------------- SZYFROWANIE FERNET --------------------
+def load_encryption_key():
+    if os.path.exists(ENCRYPTION_KEY_FILE):
+        with open(ENCRYPTION_KEY_FILE, "rb") as file:
+            return file.read()
+    else:
+        key = Fernet.generate_key()
+        with open(ENCRYPTION_KEY_FILE, "wb") as file:
+            file.write(key)
+        return key
+
+encryption_key = load_encryption_key()
+cipher = Fernet(encryption_key)
+
+def encrypt_secret(secret: str) -> str:
+    return cipher.encrypt(secret.encode()).decode()
+
+def decrypt_secret(encrypted_secret: str) -> str:
+    return cipher.decrypt(encrypted_secret.encode()).decode()
+
+# -------------------- HASHOWANIE PIN-u (bcrypt) --------------------
+def hash_pin(pin: str) -> str:
+    salt = bcrypt.gensalt()
+    hashed = bcrypt.hashpw(pin.encode('utf-8'), salt)
+    return hashed.decode('utf-8')
+
+def check_pin(pin: str, hashed_pin: str) -> bool:
+    return bcrypt.checkpw(pin.encode('utf-8'), hashed_pin.encode('utf-8'))
+
+# -------------------- GENEROWANIE TOTP --------------------
+def generate_totp(secret, time_step=30, digits=6) -> str:
+    try:
+        cleaned_secret = secret.strip().replace(" ", "").upper()
+        key = base64.b32decode(cleaned_secret, casefold=True)
+        T = int(time.time() / time_step)
+        T_bin = struct.pack(">Q", T)
+        hmac_hash = hmac.new(key, T_bin, hashlib.sha1).digest()
+        offset = hmac_hash[-1] & 0x0F
+        binary_code = struct.unpack(">I", hmac_hash[offset:offset + 4])[0] & 0x7FFFFFFF
+        otp = binary_code % (10 ** digits)
+        return str(otp).zfill(digits)
+    except Exception as e:
+        return f"Błąd: {e}"
+
+# -------------------- GŁÓWNA KLASA APLIKACJI --------------------
+class TOTPApp:
+    def __init__(self, root: tb.Window):
+        self.root = root
+        self.root.title("TOTP Super Authenticator")
+        # Ustawiamy większe okno i możliwość zmiany rozmiaru:
+        self.root.geometry("1000x700")
+        self.root.minsize(900, 600)
+        self.root.resizable(True, True)
+
+        self.username = None
+        self.config_file = None
+        self.accounts = []
+        self.time_left = 30
+
+        # Tworzymy ramki: jedna do logowania, druga do głównego UI.
+        # Na starcie pokażemy logowanie.
+        self.login_frame = None
+        self.main_frame = None
+
+        self.create_login_frame()
+
+    # -------------------- TWORZENIE EKRANU LOGOWANIA --------------------
+    def create_login_frame(self):
+        """
+        Tworzy ramkę logowania z Notebookiem (Istniejące konto / Nowe konto).
+        Gdy logowanie się uda, niszczymy login_frame i pokazujemy main_frame.
+        """
+        self.login_frame = tb.Frame(self.root, padding=10)
+        self.login_frame.pack(fill=BOTH, expand=True)
+
+        # Notebook:
+        notebook = tb.Notebook(self.login_frame, bootstyle=PRIMARY)
+        notebook.pack(fill=BOTH, expand=True)
+
+        # --- KARTA: Istniejące konto ---
+        frame_existing = tb.Frame(notebook, padding=20)
+        notebook.add(frame_existing, text="Istniejące konto")
+
+        existing_users = [f.replace(".json", "") for f in os.listdir(CONFIG_DIR) if f.endswith(".json")]
+
+        lbl_user = tb.Label(frame_existing, text="Wybierz konto:")
+        lbl_user.pack(pady=5)
+        self.combo_users = tb.Combobox(frame_existing, values=existing_users)
+        self.combo_users.pack(pady=5, fill=X)
+
+        lbl_pin = tb.Label(frame_existing, text="Hasło/PIN:")
+        lbl_pin.pack(pady=5)
+        self.entry_pin = tb.Entry(frame_existing, show="*")
+        self.entry_pin.pack(pady=5, fill=X)
+
+        btn_login = tb.Button(frame_existing, text="Zaloguj", bootstyle=SUCCESS, command=self.on_login)
+        btn_login.pack(pady=10)
+
+        # --- KARTA: Nowe konto ---
+        frame_new = tb.Frame(notebook, padding=20)
+        notebook.add(frame_new, text="Nowe konto")
+
+        lbl_new_user = tb.Label(frame_new, text="Nazwa użytkownika:")
+        lbl_new_user.pack(pady=5)
+        self.entry_new_user = tb.Entry(frame_new)
+        self.entry_new_user.pack(pady=5, fill=X)
+
+        lbl_new_pin = tb.Label(frame_new, text="Hasło/PIN:")
+        lbl_new_pin.pack(pady=5)
+        self.entry_new_pin = tb.Entry(frame_new, show="*")
+        self.entry_new_pin.pack(pady=5, fill=X)
+
+        btn_register = tb.Button(frame_new, text="Zarejestruj", bootstyle=PRIMARY, command=self.on_register)
+        btn_register.pack(pady=10)
+
+    def on_login(self):
+        username = self.combo_users.get().strip()
+        password = self.entry_pin.get().strip()
+        if not username or not password:
+            Messagebox.show_error("Wszystkie pola są wymagane!", "Błąd")
+            return
+
+        config_file = os.path.join(CONFIG_DIR, f"{username}.json")
+        if not os.path.exists(config_file):
+            Messagebox.show_error("Konto nie istnieje!", "Błąd")
+            return
+
+        with open(config_file, "r") as f:
+            data = json.load(f)
+        stored_pin = data.get("pin")
+        if stored_pin and check_pin(password, stored_pin):
+            self.username = username
+            self.config_file = config_file
+            self.show_main_frame()
+        else:
+            Messagebox.show_error("Nieprawidłowe hasło/PIN!", "Błąd")
+
+    def on_register(self):
+        username = self.entry_new_user.get().strip()
+        pin = self.entry_new_pin.get().strip()
+        if not username or not pin:
+            Messagebox.show_error("Wszystkie pola są wymagane!", "Błąd")
+            return
+        if len(pin) < 4:
+            Messagebox.show_error("PIN musi mieć co najmniej 4 znaki!", "Błąd")
+            return
+
+        config_file = os.path.join(CONFIG_DIR, f"{username}.json")
+        if os.path.exists(config_file):
+            Messagebox.show_error("Konto już istnieje!", "Błąd")
+            return
+
+        hashed = hash_pin(pin)
+        with open(config_file, "w") as f:
+            json.dump({"pin": hashed, "accounts": []}, f, indent=2)
+
+        self.username = username
+        self.config_file = config_file
+        self.show_main_frame()
+
+    # -------------------- PRZEJŚCIE DO GŁÓWNEGO UI --------------------
+    def show_main_frame(self):
+        """ Niszczy ramkę logowania i tworzy główną ramkę z listą kont TOTP. """
+        if self.login_frame:
+            self.login_frame.destroy()
+            self.login_frame = None
+
+        self.main_frame = tb.Frame(self.root, padding=10)
+        self.main_frame.pack(fill=BOTH, expand=True)
+
+        # Wczytujemy konta
+        self.load_accounts()
+
+        # -- Listbox z paskiem przewijania --
+        list_frame = tb.Frame(self.main_frame)
+        list_frame.pack(side=TOP, fill=BOTH, expand=True)
+
+        scrollbar = tb.Scrollbar(list_frame, bootstyle=ROUND)  
+        scrollbar.pack(side=RIGHT, fill=Y)
+
+        self.listbox = Listbox(list_frame, yscrollcommand=scrollbar.set, font=("Arial", 12))
+        self.listbox.pack(side=LEFT, fill=BOTH, expand=True)
+        scrollbar.config(command=self.listbox.yview)
+
+        # -- Pierwszy rząd przycisków --
+        btn_frame1 = tb.Frame(self.main_frame)
+        btn_frame1.pack(side=TOP, fill=X, pady=5)
+
+        tb.Button(btn_frame1, text="Odśwież kody", bootstyle=INFO, command=self.manual_refresh_totp).pack(side=LEFT, padx=5)
+        tb.Button(btn_frame1, text="Dodaj konto", bootstyle=PRIMARY, command=self.add_account).pack(side=LEFT, padx=5)
+        tb.Button(btn_frame1, text="Usuń konto", bootstyle=DANGER, command=self.remove_account).pack(side=LEFT, padx=5)
+        tb.Button(btn_frame1, text="Skanuj QR z pliku", bootstyle=WARNING, command=self.scan_qr_code).pack(side=LEFT, padx=5)
+        tb.Button(btn_frame1, text="Pokaż kod QR", bootstyle=SECONDARY, command=self.show_qr_code).pack(side=LEFT, padx=5)
+
+        # -- Drugi rząd przycisków --
+        btn_frame2 = tb.Frame(self.main_frame)
+        btn_frame2.pack(side=TOP, fill=X, pady=5)
+
+        tb.Button(btn_frame2, text="Eksportuj konta", bootstyle=PRIMARY, command=self.export_accounts).pack(side=LEFT, padx=5)
+        tb.Button(btn_frame2, text="Importuj konta", bootstyle=PRIMARY, command=self.import_accounts).pack(side=LEFT, padx=5)
+
+        if CAN_SCREENSHOT:
+            tb.Button(btn_frame2, text="Skanuj QR (z ekranu)", bootstyle=WARNING, command=self.scan_qr_from_screen).pack(side=LEFT, padx=5)
+
+        # -- Etykieta z odliczaniem --
+        self.countdown_label = tb.Label(self.main_frame, text="", bootstyle=LIGHT, font=("Arial", 12))
+        self.countdown_label.pack(side=TOP, pady=5)
+
+        # Pierwsze odświeżenie kodów i start licznika
+        self.refresh_totp()
+        self.update_countdown()
+
+    # -------------------- OBSŁUGA KONT --------------------
+    def load_accounts(self):
+        if not self.config_file:
+            return
+        try:
+            with open(self.config_file, "r") as f:
+                data = json.load(f)
+                self.accounts = data.get("accounts", [])
+                # Odszyfrowujemy
+                for acc in self.accounts:
+                    acc["secret"] = decrypt_secret(acc["secret"])
+        except FileNotFoundError:
+            self.accounts = []
+
+    def save_accounts(self):
+        if not self.config_file:
+            return
+        data = {"pin": "", "accounts": []}
+        try:
+            with open(self.config_file, "r") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            pass
+
+        new_list = []
+        for acc in self.accounts:
+            new_list.append({
+                "issuer": acc["issuer"],
+                "account": acc["account"],
+                "secret": encrypt_secret(acc["secret"])
+            })
+        data["accounts"] = new_list
+
+        with open(self.config_file, "w") as f:
+            json.dump(data, f, indent=2)
+
+    # -------------------- TOTP - odświeżanie i countdown --------------------
+    def refresh_totp(self):
+        self.listbox.delete(0, END)
+        for acc in self.accounts:
+            try:
+                code = generate_totp(acc["secret"])
+                display_text = f"{acc['issuer']} ({acc['account']}): {code}"
+            except Exception:
+                display_text = f"{acc['issuer']} ({acc['account']}): BŁĄD"
+            self.listbox.insert(END, display_text)
+
+    def manual_refresh_totp(self):
+        self.time_left = 30
+        self.refresh_totp()
+
+    def update_countdown(self):
+        if self.main_frame is not None:
+            if self.time_left <= 0:
+                self.refresh_totp()
+                self.time_left = 30
+            else:
+                self.time_left -= 1
+
+            self.countdown_label.config(text=f"Kod odświeży się za: {self.time_left}s")
+
+        # wywołuj co 1 sekundę
+        self.root.after(1000, self.update_countdown)
+
+    # -------------------- DODAJ/USUŃ KONTO --------------------
+    def add_account(self):
+        dialog = tb.Toplevel(self.root)
+        dialog.title("Dodaj konto")
+        dialog.geometry("400x220")
+        dialog.resizable(True, True)
+
+        lbl_issuer = tb.Label(dialog, text="Nazwa usługi (np. Google):")
+        lbl_issuer.pack(pady=5)
+        entry_issuer = tb.Entry(dialog)
+        entry_issuer.pack(pady=5, fill=X, padx=20)
+
+        lbl_account = tb.Label(dialog, text="Nazwa konta:")
+        lbl_account.pack(pady=5)
+        entry_account = tb.Entry(dialog)
+        entry_account.pack(pady=5, fill=X, padx=20)
+
+        lbl_secret = tb.Label(dialog, text="Tajny klucz (Base32):")
+        lbl_secret.pack(pady=5)
+        entry_secret = tb.Entry(dialog)
+        entry_secret.pack(pady=5, fill=X, padx=20)
+
+        def save_acc():
+            issuer = entry_issuer.get().strip()
+            account = entry_account.get().strip()
+            secret = entry_secret.get().strip()
+
+            if not issuer or not account or not secret:
+                Messagebox.show_error("Wszystkie pola są wymagane!", "Błąd")
+                return
+
+            existing = [a for a in self.accounts if a["issuer"] == issuer and a["account"] == account]
+            if existing:
+                ans = Messagebox.ask_yesno("Duplikat", f"Konto {issuer} ({account}) już istnieje.\nNadpisać?")
+                if not ans:
+                    return
+                self.accounts = [a for a in self.accounts
+                                 if not (a["issuer"] == issuer and a["account"] == account)]
+
+            self.accounts.append({"issuer": issuer, "account": account, "secret": secret})
+            self.save_accounts()
+            self.refresh_totp()
+            self.time_left = 30
+            dialog.destroy()
+
+        btn_save = tb.Button(dialog, text="Zapisz", bootstyle=SUCCESS, command=save_acc)
+        btn_save.pack(pady=10)
+
+    def remove_account(self):
+        selection = self.listbox.curselection()
+        if not selection:
+            Messagebox.show_error("Wybierz konto do usunięcia!", "Błąd")
+            return
+        self.accounts.pop(selection[0])
+        self.save_accounts()
+        self.refresh_totp()
+        self.time_left = 30
+
+    # -------------------- SKANOWANIE QR --------------------
+    def scan_qr_code(self):
+        file_path = filedialog.askopenfilename(
+            title="Wybierz obraz z kodem QR",
+            filetypes=[("Pliki obrazów", "*.png *.jpg *.jpeg *.gif")]
+        )
+        if not file_path:
+            return
+        try:
+            img = Image.open(file_path)
+            result = decode(img)
+            if not result:
+                Messagebox.show_error("Nie znaleziono kodu QR w pliku!", "Błąd")
+                return
+            uri = result[0].data.decode()
+
+            if not uri.startswith("otpauth://"):
+                Messagebox.show_error("Niepoprawny format URI (otpauth://)!", "Błąd")
+                return
+
+            self.add_from_otpauth_uri(uri)
+            Messagebox.show_info("Konto dodane pomyślnie!", "Sukces")
+        except Exception as e:
+            Messagebox.show_error(f"Błąd dekodowania: {str(e)}", "Błąd")
+
+    def add_from_otpauth_uri(self, uri: str):
+        parsed = urlparse(uri)
+        q = parse_qs(parsed.query)
+        secret_list = q.get("secret", [])
+        if not secret_list:
+            raise ValueError("Brak parametru secret!")
+        secret = secret_list[0]
+
+        issuer_in_params = q.get("issuer", [None])[0]
+        path = parsed.path.lstrip('/')
+        if ":" in path:
+            issuer_from_path, account_from_path = path.split(":", 1)
+        else:
+            issuer_from_path = path
+            account_from_path = "Unknown"
+
+        issuer = issuer_in_params if issuer_in_params else issuer_from_path
+        account = account_from_path
+
+        existing = [acc for acc in self.accounts
+                    if acc["issuer"] == issuer and acc["account"] == account]
+        if existing:
+            ans = Messagebox.ask_yesno("Duplikat", f"Konto {issuer} ({account}) już istnieje.\nNadpisać?")
+            if not ans:
+                return
+            self.accounts = [acc for acc in self.accounts
+                             if not (acc["issuer"] == issuer and acc["account"] == account)]
+
+        self.accounts.append({
+            "issuer": issuer if issuer else "Unknown",
+            "account": account,
+            "secret": secret
+        })
+        self.save_accounts()
+        self.refresh_totp()
+        self.time_left = 30
+
+    # -------------------- POKAŻ QR --------------------
+    def show_qr_code(self):
+        selection = self.listbox.curselection()
+        if not selection:
+            Messagebox.show_error("Wybierz konto!", "Błąd")
+            return
+
+        acc = self.accounts[selection[0]]
+        issuer = acc["issuer"]
+        account = acc["account"]
+        secret = acc["secret"]
+        uri = f"otpauth://totp/{issuer}:{account}?secret={secret}&issuer={issuer}"
+
+        qr_img = qrcode.make(uri)
+
+        qr_window = tb.Toplevel(self.root)
+        qr_window.title("Kod QR")
+        qr_window.geometry("300x350")
+        qr_window.resizable(True, True)
+
+        tk_img = ImageTk.PhotoImage(qr_img)
+        lbl_img = tb.Label(qr_window, image=tk_img)
+        lbl_img.image = tk_img
+        lbl_img.pack(pady=10)
+
+        tb.Label(qr_window, text=f"{issuer} ({account})").pack()
+
+    # -------------------- SKANOWANIE Z EKRANU --------------------
+    def scan_qr_from_screen(self):
+        if not CAN_SCREENSHOT:
+            Messagebox.show_error("Brak biblioteki pyautogui!", "Błąd")
+            return
+        try:
+            screenshot = pyautogui.screenshot()
+            result = decode(screenshot)
+            if not result:
+                Messagebox.show_error("Nie znaleziono kodu QR na ekranie!", "Błąd")
+                return
+            uri = result[0].data.decode()
+            if not uri.startswith("otpauth://"):
+                Messagebox.show_error("Niepoprawny format URI (otpauth://)!", "Błąd")
+                return
+
+            self.add_from_otpauth_uri(uri)
+            Messagebox.show_info("Zeskanowano QR z ekranu i dodano konto!", "Sukces")
+        except Exception as e:
+            Messagebox.show_error(f"Błąd skanowania ekranu: {str(e)}", "Błąd")
+
+    # -------------------- IMPORT / EXPORT --------------------
+    def export_accounts(self):
+        file_path = filedialog.asksaveasfilename(defaultextension=".json",
+                                                 filetypes=[("Pliki JSON", "*.json")])
+        if not file_path:
+            return
+        try:
+            data = {"accounts": []}
+            for acc in self.accounts:
+                data["accounts"].append({
+                    "issuer": acc["issuer"],
+                    "account": acc["account"],
+                    "secret": encrypt_secret(acc["secret"])
+                })
+            with open(file_path, "w") as f:
+                json.dump(data, f, indent=2)
+            Messagebox.show_info("Konta zostały wyeksportowane!", "Sukces")
+        except Exception as e:
+            Messagebox.show_error(f"Błąd eksportu: {str(e)}", "Błąd")
+
+    def import_accounts(self):
+        file_path = filedialog.askopenfilename(filetypes=[("Pliki JSON", "*.json")])
+        if not file_path:
+            return
+        try:
+            with open(file_path, "r") as f:
+                data = json.load(f)
+            for acc in data.get("accounts", []):
+                enc = acc["secret"]
+                try:
+                    dec = decrypt_secret(enc)
+                except Exception:
+                    Messagebox.show_error("Nie udało się odszyfrować sekretu!", "Błąd")
+                    continue
+
+                issuer = acc["issuer"]
+                account = acc["account"]
+
+                existing = [a for a in self.accounts
+                            if a["issuer"] == issuer and a["account"] == account]
+                if existing:
+                    ans = Messagebox.ask_yesno("Duplikat",
+                                               f"Konto {issuer} ({account}) już istnieje.\nNadpisać?")
+                    if not ans:
+                        continue
+                    self.accounts = [a for a in self.accounts
+                                     if not (a["issuer"] == issuer and a["account"] == account)]
+
+                self.accounts.append({
+                    "issuer": issuer,
+                    "account": account,
+                    "secret": dec
+                })
+
+            self.save_accounts()
+            self.refresh_totp()
+            self.time_left = 30
+            Messagebox.show_info("Konta zostały zaimportowane!", "Sukces")
+        except Exception as e:
+            Messagebox.show_error(f"Błąd importu: {str(e)}", "Błąd")
+
+
+# -------------------- URUCHOMIENIE APLIKACJI --------------------
+if __name__ == "__main__":
+    # Możesz wybrać np. "flatly", "darkly", "cyborg", "superhero", "cosmo", itp.
+    root = tb.Window(themename="flatly")
+    app = TOTPApp(root)
+    root.mainloop()
